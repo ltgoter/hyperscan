@@ -9,6 +9,8 @@
 autom4te.cache
 autojunk
 .dirstamp
+build
+.vscode
 
 # Temp and swap files
 *~

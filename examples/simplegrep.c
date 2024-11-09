@@ -58,8 +58,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include <hs.h>
+
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+static int gsHint = 0;
 
 /**
  * This is the function that will be called for each match that occurs. @a ctx
@@ -69,7 +74,8 @@
  */
 static int eventHandler(unsigned int id, unsigned long long from,
                         unsigned long long to, unsigned int flags, void *ctx) {
-    printf("Match for pattern \"%s\" at offset %llu\n", (char *)ctx, to);
+    // printf("Match for pattern \"%s\" at offset %llu\n", (char *)ctx, to);
+    gsHint++;
     return 0;
 }
 
@@ -144,23 +150,9 @@ static char *readInputData(const char *inputFN, unsigned int *length) {
     return inputData;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <pattern> <input file>\n", argv[0]);
-        return -1;
-    }
-
-    char *pattern = argv[1];
-    char *inputFN = argv[2];
-
-    if (access(inputFN, F_OK) != 0) {
-        fprintf(stderr, "ERROR: file doesn't exist.\n");
-        return -1;
-    }
-    if (access(inputFN, R_OK) != 0) {
-        fprintf(stderr, "ERROR: can't be read.\n");
-        return -1;
-    }
+static int hyperScanMethod(const char *inputData, unsigned int length, char *pattern)
+{
+    int ret = 0;
 
     /* First, we attempt to compile the pattern provided on the command line.
      * We assume 'DOTALL' semantics, meaning that the '.' meta-character will
@@ -177,15 +169,7 @@ int main(int argc, char *argv[]) {
         hs_free_compile_error(compile_err);
         return -1;
     }
-
-    /* Next, we read the input data file into a buffer. */
-    unsigned int length;
-    char *inputData = readInputData(inputFN, &length);
-    if (!inputData) {
-        hs_free_database(database);
-        return -1;
-    }
-
+    
     /* Finally, we issue a call to hs_scan, which will search the input buffer
      * for the pattern represented in the bytecode. Note that in order to do
      * this, scratch space needs to be allocated with the hs_alloc_scratch
@@ -205,27 +189,162 @@ int main(int argc, char *argv[]) {
     hs_scratch_t *scratch = NULL;
     if (hs_alloc_scratch(database, &scratch) != HS_SUCCESS) {
         fprintf(stderr, "ERROR: Unable to allocate scratch space. Exiting.\n");
-        free(inputData);
-        hs_free_database(database);
+        goto l_freedb;
         return -1;
     }
 
-    printf("Scanning %u bytes with Hyperscan\n", length);
-
-    if (hs_scan(database, inputData, length, 0, scratch, eventHandler,
-                pattern) != HS_SUCCESS) {
-        fprintf(stderr, "ERROR: Unable to scan input buffer. Exiting.\n");
-        hs_free_scratch(scratch);
-        free(inputData);
-        hs_free_database(database);
-        return -1;
-    }
+    ret = hs_scan(database, inputData, length, 0, scratch, eventHandler,
+                pattern);
 
     /* Scanning is complete, any matches have been handled, so now we just
      * clean up and exit.
      */
     hs_free_scratch(scratch);
-    free(inputData);
+l_freedb:
     hs_free_database(database);
+    return ret;
+
+}
+
+static int rookieScanMethod(const char *inputData, unsigned int length, char *pattern)
+{
+    size_t plen = strlen(pattern);
+
+    gsHint = 0;
+    for (size_t i = 0; i < length - (plen - 1); i++)
+    {
+        ///< 逐行检查pattern的字符
+        for (size_t j = 0; j < plen; j++)
+        {
+            if (pattern[j] != inputData[i + j])
+            {
+                break;
+            }
+            else if (j == plen - 1)
+            {
+                // hit 
+                eventHandler(0, 0, i, 0, pattern);
+            }
+            
+        }
+    }
+    
     return 0;
+}
+
+static int myBMScanMethod(const char *inputData, unsigned int length, char *pattern)
+{
+    size_t plen = strlen(pattern);
+    char tmpHint[16] = {0};
+    #pragma ivdep
+    for (size_t i = 0; i < length - (plen - 1); i++)
+    {
+        ///< 逐行检查pattern的字符
+        #pragma ivdep
+        for (size_t j = 0; j < plen; j++)
+        {
+            if (unlikely(pattern[j] != inputData[i + j]))
+            {
+                break;
+            }
+            else if (unlikely(j == plen - 1))
+            {
+                // hit 
+                // eventHandler(0, 0, i, 0, pattern);
+                tmpHint[j]++;
+            }
+            
+        }
+    }
+
+    #pragma omp simd reduction(+:gsHint)
+    for (size_t j = 0; j < 16; j++)
+    {
+        gsHint += tmpHint[j];
+    }
+
+    return 0;
+}
+
+static int memScanMethod(const char *inputData, unsigned int length, char *pattern)
+{
+    
+    for (size_t i = 0; i < length; i++)
+    {
+        if (pattern[0] == inputData[i])
+        {
+            eventHandler(0, 0, i, 0, pattern);
+        }
+    }
+
+    return 0;
+}
+
+static int paraScanMethod(const char *inputData, unsigned int length, char *pattern)
+{
+    return 0;
+}
+
+typedef int (*ScanFun)(const char *inputData, unsigned int length, char *pattern);
+
+typedef struct ScanTestItem
+{
+    const char *testName;
+    ScanFun     testFun;
+} ScanTestItem_t;
+
+///< TODO: 缺少校验方法
+
+ScanTestItem_t testFuncArr[] = 
+{
+    { .testName = "allMemScan",     .testFun = memScanMethod},
+    { .testName = "hyperScan",      .testFun = hyperScanMethod},
+    { .testName = "rookieScan",     .testFun = rookieScanMethod},
+    { .testName = "myBMScanMethod", .testFun = myBMScanMethod},
+    { .testName = "myScan",         .testFun = paraScanMethod},
+};
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <pattern> <input file>\n", argv[0]);
+        return -1;
+    }
+
+    int ret = 0;
+    char *pattern = argv[1];
+    char *inputFN = argv[2];
+
+    if (access(inputFN, F_OK) != 0) {
+        fprintf(stderr, "ERROR: file doesn't exist.\n");
+        return -1;
+    }
+    if (access(inputFN, R_OK) != 0) {
+        fprintf(stderr, "ERROR: can't be read.\n");
+        return -1;
+    }
+
+    /* Next, we read the input data file into a buffer. */
+    unsigned int length;
+    char *inputData = readInputData(inputFN, &length);
+    if (!inputData) {
+        return -1;
+    }
+
+    printf("Scanning %u bytes with Hyperscan\n", length);
+
+    for (int idx = 0; idx < (int)(sizeof(testFuncArr)/sizeof(testFuncArr[0])); idx++)
+    {
+        gsHint = 0;
+        ScanTestItem_t *pTest = testFuncArr + idx;
+        struct timeval start, end;
+        gettimeofday(&start, NULL);
+        pTest->testFun(inputData, length, pattern);
+        gettimeofday(&end, NULL);
+
+        double duration = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_usec - start.tv_usec) / 1000.0;
+        printf("[%24s: %8s hit %12d]Time measured: %10.3f ms.\n", pTest->testName, ret == HS_SUCCESS ? "DONE" : "ERROR", gsHint, duration);
+    }
+
+    free(inputData);
+    return ret;
 }

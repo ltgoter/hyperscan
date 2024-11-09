@@ -40,6 +40,8 @@ endif()
 set(BINDIR "${PROJECT_BINARY_DIR}/bin")
 set(LIBDIR "${PROJECT_BINARY_DIR}/lib")
 
+set(CMAKE_VERBOSE_MAKEFILE ON)
+
 set(INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR})
 
 # First for the generic no-config case
